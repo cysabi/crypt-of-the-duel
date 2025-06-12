@@ -5,19 +5,69 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/olahol/melody"
 )
 
 type Game struct {
-	turnCount     int
-	actedThisBeat map[PlayerId]bool
+	mu        sync.Mutex
+	turnCount int
+	// actedThisBeat map[PlayerId]bool
+	actions map[PlayerId]PayloadAction // Accumulated actions for the current beat
 }
 
 func (g Game) New() Game {
 	g.turnCount = 0
-	g.actedThisBeat = make(map[PlayerId]bool)
+	// g.actedThisBeat = make(map[PlayerId]bool)
+	g.actions = make(map[PlayerId]PayloadAction)
 	return g
+}
+
+func (g *Game) ReceiveAction(pid PlayerId, action PayloadAction) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if action.turnCount != g.turnCount {
+		// Ignore actions not for the current beat
+		return
+	}
+	// Only accept the first action per player per beat
+	if _, exists := g.actions[pid]; !exists {
+		g.actions[pid] = action
+	}
+}
+
+func (g *Game) ProcessBeat(m *melody.Melody) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Get all player IDs
+	sessions, err := m.Sessions()
+	if err != nil {
+		panic(err)
+	}
+
+	for _, session := range sessions {
+		pid := session.MustGet("pid").(PlayerId)
+		if _, acted := g.actions[pid]; !acted {
+			// Insert a skip action for players who didn't act
+			g.actions[pid] = PayloadAction{
+				pid:       pid,
+				turnCount: g.turnCount,
+				action:    "skip",
+			}
+		}
+	}
+
+	// Broadcast all actions for this beat
+	for _, action := range g.actions {
+		m.Broadcast([]byte(action.String()))
+	}
+
+	// Prepare for next beat
+	g.actions = make(map[PlayerId]PayloadAction)
+	g.turnCount++
 }
 
 func (g *Game) BroadcastMissing(m *melody.Melody) {
@@ -59,6 +109,14 @@ func main() {
 	m := melody.New()
 	game := Game{}.New()
 
+	go func() {
+		beatDuration := 200 * time.Millisecond // Set your beat duration here
+		for {
+			time.Sleep(beatDuration)
+			game.ProcessBeat(m)
+		}
+	}()
+
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		m.HandleRequest(w, r)
 	})
@@ -77,33 +135,13 @@ func main() {
 	})
 
 	m.HandleMessage(func(s *melody.Session, msg []byte) {
-		//
-		//  p1: M   M   M   M   M
-		//  p2: M   M   s   s
-		//
-		// player makes move (send message)
-		// server receives message -> m.HandleMessage
-		// 	if player turn is ahead of game turn, call BroadcastMissing() which has all other players broadcast a skip move
-		// 	if player turn is on game turn, set actedThisBeat and broadcast move to other players
-		//  broadcast move to other players so they're at most 1 turn behind
-
 		pid := s.MustGet("pid").(PlayerId)
-		switch payload := recievePayload(pid, string(msg)).(type) {
-
+		payload := recievePayload(pid, string(msg))
+		switch p := payload.(type) {
 		case PayloadAction:
-			for payload.turnCount > game.turnCount {
-				game.BroadcastMissing(m)
-				game.actedThisBeat = make(map[PlayerId]bool)
-				game.turnCount += 1
-			}
-			if payload.turnCount == game.turnCount {
-				game.actedThisBeat[pid] = true
-				m.Broadcast([]byte(payload.String()))
-			}
-
+			game.ReceiveAction(pid, p)
 		case PayloadStart:
-			m.Broadcast([]byte(payload.String()))
-
+			m.Broadcast([]byte(p.String()))
 		}
 	})
 
