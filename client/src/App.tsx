@@ -1,5 +1,6 @@
 import useClient from "./client/useClient";
 import Board from "./board";
+import MovingBars from "./board/MovingBars";
 import { StartScreen } from "./views/startScreen";
 
 function App() {
@@ -22,6 +23,7 @@ function App() {
       <div className="flex-grow">
         <Board gameState={view} />
       </div>
+      {/* <MovingBars duration={2} /> */}
     </div>
   );
 }
